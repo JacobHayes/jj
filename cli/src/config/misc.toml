@@ -33,6 +33,7 @@ quiet = false
 log-word-wrap = false
 log-synthetic-elided-nodes = true
 conflict-marker-style = "diff"
+signed-off-by = false
 
 [ui.movement]
 edit = false
