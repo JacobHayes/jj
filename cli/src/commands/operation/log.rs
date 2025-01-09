@@ -14,16 +14,21 @@
 
 use std::slice;
 
+use clap_complete::ArgValueCandidates;
+use indexmap::IndexMap;
 use itertools::Itertools as _;
 use jj_lib::config::ConfigGetError;
 use jj_lib::config::ConfigGetResultExt as _;
+use jj_lib::graph;
 use jj_lib::graph::reverse_graph;
 use jj_lib::graph::GraphEdge;
-use jj_lib::op_store::OpStoreError;
+use jj_lib::graph::GraphEdgeType;
 use jj_lib::op_walk;
 use jj_lib::operation::Operation;
 use jj_lib::repo::RepoLoader;
 use jj_lib::settings::UserSettings;
+use jj_lib::str_util::StringPattern;
+use jj_lib::view::View;
 
 use super::diff::show_op_diff;
 use crate::cli_util::format_template;
@@ -32,6 +37,7 @@ use crate::cli_util::LogContentFormat;
 use crate::cli_util::WorkspaceCommandEnvironment;
 use crate::command_error::CommandError;
 use crate::commit_templater::CommitTemplateLanguage;
+use crate::complete;
 use crate::diff_util::diff_formats_for_log;
 use crate::diff_util::DiffFormatArgs;
 use crate::diff_util::DiffRenderer;
@@ -67,6 +73,14 @@ pub struct OperationLogArgs {
     /// Show changes to the repository at each operation
     #[arg(long)]
     op_diff: bool,
+    /// Display only operations which change the given local bookmark, or local
+    /// bookmarks matching a pattern (can be repeated)
+    #[arg(
+        long, short,
+        value_parser = StringPattern::parse,
+        add = ArgValueCandidates::new(complete::local_bookmarks),
+    )]
+    bookmark: Vec<StringPattern>,
     /// Show patch of modifications to changes (implies --op-diff)
     ///
     /// If the previous version has different parents, it will be temporarily
@@ -109,6 +123,7 @@ fn do_op_log(
 ) -> Result<(), CommandError> {
     let settings = repo_loader.settings();
     let graph_style = GraphStyle::from_settings(settings)?;
+    let use_elided_nodes = settings.get_bool("ui.log-synthetic-elided-nodes")?;
     let with_content_format = LogContentFormat::new(ui, settings)?;
 
     let template;
@@ -197,29 +212,102 @@ fn do_op_log(
     let mut formatter = ui.stdout_formatter();
     let formatter = formatter.as_mut();
     let limit = args.limit.unwrap_or(usize::MAX);
-    let iter = op_walk::walk_ancestors(slice::from_ref(current_op));
 
-    if !args.no_graph {
-        let mut raw_output = formatter.raw()?;
-        let mut graph = get_graphlog(graph_style, raw_output.as_mut());
-        let iter = iter.map(|op| -> Result<_, OpStoreError> {
+    let iter: Box<dyn Iterator<Item = Result<_, CommandError>>> = if args.bookmark.is_empty() {
+        let iter = op_walk::walk_ancestors(slice::from_ref(current_op));
+        let iter = iter.map(|op| -> Result<_, CommandError> {
             let op = op?;
             let edges = op.parents().map_ok(GraphEdge::direct).try_collect()?;
             Ok((op, edges))
         });
+        Box::new(iter)
+    } else {
+        let ops = graph::topo_order_reverse_graph_filter_ok(
+            slice::from_ref(current_op).iter().cloned().map(Ok),
+            |op| op.id().clone(),
+            |op| {
+                let view = op.view()?;
+                let parents: Vec<_> = op.parents().try_collect()?;
+                // TODO: Fix error types?
+                let parent_op = repo_loader.merge_operations(parents, None).unwrap();
+                let parent_view = parent_op.view()?;
+
+                let get_matching_bookmarks = |view: &View| {
+                    let mut bookmarks = IndexMap::new();
+                    for pattern in &args.bookmark {
+                        let matches = view
+                            .local_bookmarks_matching(pattern)
+                            .map(|(name, targets)| (name.to_owned(), targets.to_owned()));
+                        bookmarks.extend(matches);
+                    }
+                    bookmarks
+                };
+
+                let op_bookmarks = get_matching_bookmarks(&view);
+                let parent_bookmarks = get_matching_bookmarks(&parent_view);
+
+                Ok(op_bookmarks != parent_bookmarks)
+            },
+            |op| op.parents().collect_vec(),
+        )?;
+        Box::new(ops.into_iter().map(|(op, edges)| {
+            let edges = edges
+                .iter()
+                .map(|edge| -> Result<_, CommandError> {
+                    let op_id = edge.target.clone();
+                    let data = repo_loader.op_store().read_operation(&op_id)?;
+                    let op = Operation::new(repo_loader.op_store().clone(), op_id, data);
+                    Ok(GraphEdge {
+                        target: op,
+                        edge_type: edge.edge_type,
+                    })
+                })
+                .try_collect()?;
+            Ok((op, edges))
+        }))
+    };
+
+    if !args.no_graph {
+        let mut raw_output = formatter.raw()?;
+        let mut graph = get_graphlog(graph_style, raw_output.as_mut());
         let iter_nodes: Box<dyn Iterator<Item = _>> = if args.reversed {
             Box::new(reverse_graph(iter)?.into_iter().map(Ok))
         } else {
             Box::new(iter)
         };
+
         for node in iter_nodes.take(limit) {
             let (op, edges) = node?;
-            let edges = edges
-                .into_iter()
-                .map(|e| e.map(|e| e.id().clone()))
-                .collect_vec();
+
+            // The graph is keyed by (OperationId, is_synthetic)
+            let mut graphlog_edges = vec![];
+            let mut missing_edge_id = None;
+            let mut elided_targets = vec![];
+            for edge in edges {
+                let id = edge.target.id().clone();
+                match edge.edge_type {
+                    GraphEdgeType::Missing => {
+                        missing_edge_id = Some(id);
+                    }
+                    GraphEdgeType::Direct => {
+                        graphlog_edges.push(GraphEdge::direct((id, false)));
+                    }
+                    GraphEdgeType::Indirect => {
+                        if use_elided_nodes {
+                            elided_targets.push(id.clone());
+                            graphlog_edges.push(GraphEdge::direct((id, true)));
+                        } else {
+                            graphlog_edges.push(GraphEdge::indirect((id, false)));
+                        }
+                    }
+                }
+            }
+            if let Some(missing_edge_id) = missing_edge_id {
+                graphlog_edges.push(GraphEdge::missing((missing_edge_id, false)));
+            }
             let mut buffer = vec![];
-            let within_graph = with_content_format.sub_width(graph.width(op.id(), &edges));
+            let key = (op.id().clone(), false);
+            let within_graph = with_content_format.sub_width(graph.width(&key, &graphlog_edges));
             within_graph.write(ui.new_formatter(&mut buffer).as_mut(), |formatter| {
                 template.format(&op, formatter)
             })?;
@@ -232,11 +320,29 @@ fn do_op_log(
             }
             let node_symbol = format_template(ui, &Some(op), &op_node_template);
             graph.add_node(
-                op.id(),
-                &edges,
+                &key,
+                &graphlog_edges,
                 &node_symbol,
                 &String::from_utf8_lossy(&buffer),
             )?;
+
+            for elided_target in elided_targets {
+                let elided_key = (elided_target, true);
+                let real_key = (elided_key.0.clone(), false);
+                let edges = [GraphEdge::direct(real_key)];
+                let mut buffer = vec![];
+                let within_graph = with_content_format.sub_width(graph.width(&elided_key, &edges));
+                within_graph.write(ui.new_formatter(&mut buffer).as_mut(), |formatter| {
+                    writeln!(formatter.labeled("elided"), "(elided revisions)")
+                })?;
+                let node_symbol = format_template(ui, &None, &op_node_template);
+                graph.add_node(
+                    &elided_key,
+                    &edges,
+                    &node_symbol,
+                    &String::from_utf8_lossy(&buffer),
+                )?;
+            }
         }
     } else {
         let iter: Box<dyn Iterator<Item = _>> = if args.reversed {
@@ -245,7 +351,7 @@ fn do_op_log(
             Box::new(iter)
         };
         for op in iter.take(limit) {
-            let op = op?;
+            let (op, _) = op?;
             with_content_format.write(formatter, |formatter| template.format(&op, formatter))?;
             if let Some(show) = &maybe_show_op_diff {
                 show(ui, formatter, &op, &with_content_format)?;
