@@ -29,12 +29,10 @@ fn open_options() -> gix::open::Options {
     gix::open::Options::isolated().config_overrides(git_config())
 }
 
-#[allow(unused)]
 pub fn open(directory: impl Into<PathBuf>) -> gix::Repository {
     gix::open_opts(directory, open_options()).unwrap()
 }
 
-#[allow(unused)]
 pub fn init(directory: impl AsRef<Path>) -> gix::Repository {
     gix::ThreadSafeRepository::init_opts(
         directory,
@@ -46,7 +44,6 @@ pub fn init(directory: impl AsRef<Path>) -> gix::Repository {
     .to_thread_local()
 }
 
-#[allow(unused)]
 pub fn init_bare(directory: impl AsRef<Path>) -> gix::Repository {
     gix::ThreadSafeRepository::init_opts(
         directory,
@@ -58,7 +55,6 @@ pub fn init_bare(directory: impl AsRef<Path>) -> gix::Repository {
     .to_thread_local()
 }
 
-#[allow(unused)]
 pub fn clone(dest_path: &Path, url: &str) -> gix::Repository {
     let mut prepare_fetch = gix::clone::PrepareFetch::new(
         url,
@@ -78,13 +74,11 @@ pub fn clone(dest_path: &Path, url: &str) -> gix::Repository {
     repo
 }
 
-#[allow(unused)]
 pub struct CommitResult {
     pub tree_id: gix::ObjectId,
     pub commit_id: gix::ObjectId,
 }
 
-#[allow(unused)]
 pub fn add_commit(
     repo: &gix::Repository,
     reference: &str,
@@ -122,7 +116,6 @@ pub fn add_commit(
     CommitResult { tree_id, commit_id }
 }
 
-#[allow(unused)]
 pub fn commit_tree(
     repo: &gix::Repository,
     reference: &str,
@@ -136,7 +129,6 @@ pub fn commit_tree(
         .detach()
 }
 
-#[allow(unused)]
 pub fn set_head_to_id(repo: &gix::Repository, target: gix::ObjectId) {
     repo.edit_reference(gix::refs::transaction::RefEdit {
         change: gix::refs::transaction::Change::Update {
@@ -155,7 +147,6 @@ pub fn set_head_to_name(repo: &gix::Repository, target: &str) {
     symbolic_reference(repo, "HEAD", target);
 }
 
-#[allow(unused)]
 pub fn get_head_tree(repo: &gix::Repository) -> Option<gix::Tree<'_>> {
     use gix::head::peel;
 
@@ -175,7 +166,6 @@ pub fn get_head_tree(repo: &gix::Repository) -> Option<gix::Tree<'_>> {
     Some(head_tree.unwrap())
 }
 
-#[allow(unused)]
 fn signature() -> gix::actor::Signature {
     gix::actor::Signature {
         name: bstr::BString::from(GIT_USER),
@@ -183,6 +173,7 @@ fn signature() -> gix::actor::Signature {
         time: gix::date::Time::new(0, 0),
     }
 }
+
 #[allow(unused)]
 pub fn symbolic_reference(repo: &gix::Repository, reference: &str, target: &str) {
     use gix::refs::transaction;
